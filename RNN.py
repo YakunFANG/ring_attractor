@@ -30,7 +30,7 @@ def generate_dataset(batch_size=64, num_samples=1000, seq_len=250, input_duratio
         
         # Input: sin_cos for 'input_duration', zeros for the rest ??? Some questions 
         input_sequence = np.zeros((seq_len, 2))
-        input_sequence[:input_duration] = sin_cos
+        input_sequence[:seq_len] = sin_cos
 
         # Add Gaussian noise to the input
         noise = np.random.normal(0, noise_std, input_sequence.shape)
@@ -73,7 +73,7 @@ class VanillaRNN(nn.Module):
         for t in range(seq_len):
             h = self.rnn_cell(x[:, t], h)
 
-            #cAdd Gaussian noise to the hidden state
+            # Add Gaussian noise to the hidden state
             if self.recurrent_noise_std > 0:
                 noise = torch.randn_like(h) * self.recurrent_noise_std
                 h = h + noise 
@@ -93,9 +93,11 @@ def add_weight_noise(model, noise_st):
     # we can access all the parameters using model.parameters(), which includes the weights of the RNN cells and the weights of the output layer or biases 
     # Gaussian noise is generated using torch.randn_like, whcih creates a tensor of teh same shape as the input tensor
     # The noise is added to the model weights using param.add_() 
+    # breakpoint() 
     with torch.no_grad(): # Disable the gradient tracking
         for param in model.parameters():
-            noise_total = 0
+            # print("the current param is", param)
+            noise_total = 0 
             # Perturb the error for 10 times 
             noise_total = torch.randn_like(param) * noise_st
             for i in range(9):
@@ -141,6 +143,7 @@ def train_model(model, dataset, batch_size, num_epchos, learning_rate=1e-3, reco
             epoch_loss += loss.item()
 
         print(f"Epoch {epcho + 1}/{num_epchos}, Loss: {epoch_loss / (inputs.size(0) // batch_size):.6f}")
+        # For every epoch, compare the input 
         
         if (epcho + 1) % record_interval == 0:
             eval_results = evaluate_model_with_noise(model, eval_dataset, batch_size)
@@ -179,20 +182,20 @@ def evaluate_model_with_noise(model, dataset, batch_size, noise_std_list=[0, 0.0
         with torch.no_grad():
             for i in range(0, inputs.size(0), batch_size):
                 x_batch = inputs[i : i + batch_size].to(device)
-                y_batch = inputs[i : i + batch_size].to(device)
+                y_batch = targets[i : i + batch_size].to(device)
 
                 outputs = model(x_batch)
 
-                # Compute the angle from the model's output
+                # Compute the angle from the model's output, every the last one from the sequence of all the samples in the batch 
                 output_angles = torch.atan2(outputs[:, -1, 0], outputs[:, -1, 1]).cpu().numpy()
                 output_angles_deg = np.degrees(output_angles)
 
-                # Compute the input angle (from the first time step)
-                input_angles = torch.atan2(x_batch[:, 0, 0], x_batch[:, 0, 1]).cpu().numpy()
-                input_angles_deg = np.degrees(input_angles)
+                # Compute the target angle, every the last one from the sequence of all the samples in the batch 
+                target_angles = torch.atan2(y_batch[:, -1, 0], y_batch[:, -1, 1]).cpu().numpy()
+                target_angles_deg = np.degrees(target_angles)
 
                 # Compute the absolute angle error in degrees
-                angle_error = np.abs(output_angles_deg - input_angles_deg)
+                angle_error = np.abs(output_angles_deg - target_angles_deg)
                 print("the angle degree error is", angle_error)
                 # angle_error = np.min(angle_error, 360 - angle_error)
 
@@ -215,6 +218,57 @@ def save_model(model, filepath):
     torch.save(model.state_dict(), filepath)
     print(f"Model saved to {filepath}")
 
+def plot_outputs_vs_targets(model, dataset, example_idx=0):
+    """
+    Plot the model outputs abd target outputs over time for a single example 
+    :param model: The trained model.
+    :param dataset: Tuple of (inputs, targets).
+    :param example_idx: Index of the example to plot.
+    """
+    inputs, targets = dataset
+    model.eval()
+
+    # Select a single example
+    # x_example: from the original input
+    # y_example: from the standard output
+    x_example = inputs[example_idx:example_idx+1].to(device) # shape: (1, seq_len_eval, 2)
+    y_example = targets[example_idx:example_idx+1].to(device) # shape: (1, seq_len_eval, 2)
+
+    # Get model predictions
+    with torch.no_grad():
+        outputs = model(x_example)
+    
+    # Convert to numpy for plotting 
+    x_example = x_example.cpu().numpy().squeeze() # Shape: (seq_len, 2)
+    y_example = y_example.cpu().numpy().squeeze() # Shape: (seq_len, 2)
+    outputs = outputs.cpu().numpy().squeeze() 
+
+    # Plot sin(theta) and cos(theta) over time
+    time_steps = np.arange(x_example.shape[0]) # seq_len is the 
+    plt.figure(figsize=(12, 6)) 
+
+    # Plot sin(theta)
+    plt.subplot(2, 1, 1)
+    plt.plot(time_steps, x_example[:, 0], label='Input sin(theta)', linestyle='--', alpha=0.7)
+    plt.plot(time_steps, y_example[:, 0], label='Target sin(theta)', linestyle='-', linewidth=2)
+    plt.plot(time_steps, outputs[:, 0], label='Predicted sin(theta)', linestyle='-', linewidth=2)
+    plt.xlabel('Time Steps')
+    plt.ylabel('sin(theta)')
+    plt.title('sin(theta) over Time')
+    plt.legend()
+
+    plt.subplot(2, 1, 2)
+    plt.plot(time_steps, x_example[:, 1], label='Input cos(theta)', linestyle='--', alpha=0.7)
+    plt.plot(time_steps, y_example[:, 1], label='Target cos(theta)', linestyle='-', linewidth=2)
+    plt.plot(time_steps, outputs[:, 1], label='Predicted cos(theta)', linestyle='-', linewidth=2)
+    plt.xlabel('Time Steps')
+    plt.ylabel('cos(theta)')
+    plt.title('cos(theta) over Time')
+    plt.legend()
+
+    plt.tight_layout()
+    plt.savefig("outputs_vs_targets_with_input_error_rnn_error.png", dpi=300, bbox_inches="tight")
+    plt.show()
 
 # Hyperparameters
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -235,8 +289,11 @@ model = VanillaRNN().to(device)
 inputs, targets, original_degree_eval = generate_dataset(batch_size=batch_size, num_samples=1000, seq_len=250, input_duration=input_duration)
 dataset_eval = (inputs, targets)
 
-# Train model
+# Train model 
 eval_records = train_model(model=model, dataset=dataset, batch_size=batch_size, num_epchos=200, learning_rate=1e-3, eval_dataset=dataset_eval)  
+
+# plot model outputs vs targets for a single example
+plot_outputs_vs_targets(model, dataset_eval, example_idx=0)
 
 df = pd.DataFrame(eval_records)
 print(df.head())
@@ -250,7 +307,6 @@ ax.set_ylabel("Average Angle Error (degrees)")
 plt.savefig("angle_error_plot_with_input_error_rnn_error.png", dpi=300, bbox_inches="tight")
 plt.show()
 
-
 # inputs, targets = generate_dataset(batch_size=batch_size, num_samples=1000, seq_len=500, input_duration=input_duration)
 # dataset_eval = (inputs, targets)
 # eva_ seq_len = 250+ 
@@ -260,4 +316,3 @@ plt.show()
 
 save_model(model, "/Users/yakunfang/Desktop/Ring_attractor/trained_model_with_input_error_rnn_error_200epchos.pth")
     
-
