@@ -7,6 +7,7 @@ import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 import os 
+import copy 
 
 # Dataset Generation 
 def generate_dataset(batch_size=64, num_samples=1000, seq_len=250, input_duration=5, noise_std=0.01):
@@ -21,65 +22,55 @@ def generate_dataset(batch_size=64, num_samples=1000, seq_len=250, input_duratio
     """
     inputs = []
     targets = []
+    original_degrees = []
 
     for _ in range(num_samples):
         # Random angle theta (original angle value)
         theta = np.random.uniform(0, 2 * np.pi)
-        theta_degrees = np.degrees(theta)
+        theta_degree = np.degrees(theta)
         sin_cos = np.array([np.sin(theta), np.cos(theta)])
         
         # Input: sin_cos for 'input_duration', zeros for the rest ??? Some questions 
         input_sequence = np.zeros((seq_len, 2))
-        input_sequence[:seq_len] = sin_cos
+        input_sequence[0] = sin_cos
 
         # Add Gaussian noise to the input
-        noise = np.random.normal(0, noise_std, input_sequence.shape)
-        input_sequence += noise
+        noise = np.random.normal(0, noise_std, 2)
+        input_sequence[0] += noise
         
         # Target: Maintain the same sin_cos for the entire sequence
         target_sequence = np.tile(sin_cos, (seq_len, 1))
 
         inputs.append(input_sequence)
         targets.append(target_sequence)
+        original_degrees.append(theta_degree)
     
     return (
         torch.tensor(inputs, dtype=torch.float32),
         torch.tensor(targets, dtype=torch.float32),
-        theta_degrees,
+        torch.tensor(original_degrees, dtype=torch.float32),
     )
 
 # RNN Model
 class VanillaRNN(nn.Module):
     def __init__(self, input_size=2, hidden_size=300, output_size=2, recurrent_noise_std=0.01):
-        # hidden_size 300: requested by there are in total 300 neurons in the RNN 
         super(VanillaRNN, self).__init__()
         self.hidden_size = hidden_size
-        self.recurrent_noise_std = recurrent_noise_std
-
-        # Recurrent weights; since the RNN is constructed by multiple cells
-        # nn.RNNCell: a single recurrent step for a vanilla RNN, taking the current input and the previous hidden state as inputs, 
-        # and computes the next hidden state 
-        # specify the activation function to be relu 
+        # self.recurrent_noise_std = recurrent_noise_std
         self.rnn_cell = nn.RNNCell(input_size, hidden_size, nonlinearity="relu")
-
-        # Output layer
         self.output_layer = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
         batch_size, seq_len, _ = x.size()
         h = torch.zeros(batch_size, self.hidden_size, device=x.device)
-
         outputs = []
         for t in range(seq_len):
             h = self.rnn_cell(x[:, t], h)
-
-            # Add Gaussian noise to the hidden state
-            if self.recurrent_noise_std > 0:
-                noise = torch.randn_like(h) * self.recurrent_noise_std
-                h = h + noise 
-            
+            # Add Gaussian noise to the hidden state if specified
+            #if self.recurrent_noise_std > 0:
+            #    noise = torch.randn_like(h) * self.recurrent_noise_std
+            #    h = h + noise 
             outputs.append(self.output_layer(h))
-
         return torch.stack(outputs, dim=1)
     
 # Function to add Gaussian noise to model weights
@@ -94,28 +85,13 @@ def add_weight_noise(model, noise_st):
     # Gaussian noise is generated using torch.randn_like, whcih creates a tensor of teh same shape as the input tensor
     # The noise is added to the model weights using param.add_() 
     # breakpoint() 
-    with torch.no_grad(): # Disable the gradient tracking
+    with torch.no_grad(): 
         for param in model.parameters():
-            # print("the current param is", param)
-            noise_total = 0 
-            # Perturb the error for 10 times 
-            noise_total = torch.randn_like(param) * noise_st
-            for i in range(9):
-                noise_total += torch.randn_like(param) * noise_st
-            noise_average = noise_total/10
-            param.add_(noise_average)
+            noise = torch.randn_like(param) * noise_st
+            param.add_(noise)
 
 # Training Function
-def train_model(model, dataset, batch_size, num_epchos, learning_rate=1e-3, record_interval=50, eval_dataset=[]):
-    """
-    Train the RNN model on the dataset.
-    :param model: The RNN model.
-    :param dataset: Tuple of (inputs, targets).
-    :param batch_size: Tuple of (inputs, targets).
-    :param num_epochs: Number of epchos for training
-    :param learning_rate: Learning rate for optimizer.
-    :param eval_dataset: dataset used for evaluation process 
-    """
+def train_model(model, dataset, batch_size, num_epchos, learning_rate=1e-3, record_interval=10, eval_dataset=None, original_degrees=None):
     inputs, targets = dataset
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     criterion = nn.MSELoss()
@@ -123,48 +99,45 @@ def train_model(model, dataset, batch_size, num_epchos, learning_rate=1e-3, reco
 
     for epcho in range(num_epchos):
         model.train()
-
-        # Shuffle the datatset for each epoch ???
         permutation = torch.randperm(inputs.size(0))
         inputs = inputs[permutation]
         targets = targets[permutation]
-
         epoch_loss = 0
         for i in range(0, inputs.size(0), batch_size):
             x_batch = inputs[i : i + batch_size].to(device)
             y_batch = targets[i : i + batch_size].to(device)
-
             optimizer.zero_grad()
             outputs = model(x_batch)
             loss = criterion(outputs, y_batch)
             loss.backward()
             optimizer.step()
-
             epoch_loss += loss.item()
+        avg_loss = epoch_loss / (inputs.size(0) // batch_size)
+        print(f"Epoch {epcho + 1}/{num_epchos}, Loss: {avg_loss:.6f}")
 
-        print(f"Epoch {epcho + 1}/{num_epchos}, Loss: {epoch_loss / (inputs.size(0) // batch_size):.6f}")
-        # For every epoch, compare the input 
-        
-        if (epcho + 1) % record_interval == 0:
-            eval_results = evaluate_model_with_noise(model, eval_dataset, batch_size)
-            for noise_std, angle_error in eval_results.items():
+        # Evaluate every record_interval epochs if eval_dataset is provided
+        if eval_dataset is not None and (epcho + 1) % record_interval == 0:
+            # Evaluate for each noise condition separately
+            eval_results = evaluate_model_with_noise(model, eval_dataset, batch_size, noise_std_list=[0, weight_noise_std], original_degree=original_degrees)
+            for noise_std, stats in eval_results.items():
                 eval_records.append({
                     'epoch': epcho + 1,
                     'noise_std': noise_std,
-                    'angle_error': angle_error
+                    'mean_angle_error': stats['mean'],
+                    'std_angle_error': stats['std']
                 })
     
     return eval_records
 
-# Evaluation Function
+"""
 def evaluate_model_with_noise(model, dataset, batch_size, noise_std_list=[0, 0.003]):
-    """
-    Evaluate the model after adding Gaussian noise to its weights.
-    :param model: The trained model.
-    :param dataset: Tuple of (inputs, targets).
-    :param batch_size: Batch size for evaluation.
-    :param noise_std: Standard deviation of the Gaussian noise added to weights
-    """
+    
+    # Evaluate the model after adding Gaussian noise to its weights.
+    # :param model: The trained model.
+    # :param dataset: Tuple of (inputs, targets).
+    # :param batch_size: Batch size for evaluation.
+    # :param noise_std: Standard deviation of the Gaussian noise added to weights
+    
     inputs, targets = dataset
     criterion = nn.MSELoss() # Used to compute the loss value
     results = {} 
@@ -209,45 +182,92 @@ def evaluate_model_with_noise(model, dataset, batch_size, noise_std_list=[0, 0.0
         results[noise_std] = avg_angle_error
 
         print(f"Average Angle Error (in degrees, std={noise_std}): {avg_angle_error:.6f}")
+    
     return results
 
     #print(f"Evaluation Loss (with weight noise std={noise_std}): {avg_loss:.6f}")
     #print(f"Average Angle Error (in degrees): {avg_angle_error:.6f}")
+"""
+
+# Evaluation function: For each noise_std, sample 10 different perturbations, evaluate separately, and compute mean and std.
+def evaluate_model_with_perturbations(model, dataset, batch_size, noise_std, n_iter=10, original_degree=None):
+    """
+    Evaluate the model after adding Gaussian noise to its weights.
+    For a given noise_std, sample n_iter different perturbations, evaluate each separately, 
+    and return the mean and std of the angle error.
+    :param model: The trained model.
+    :param dataset: Tuple of (inputs, targets).
+    :param batch_size: Batch size for evaluation.
+    :param noise_std: The standard deviation of the weight noise.
+    :param n_iter: Number of perturbation samples.
+    :return: (mean_angle_error, std_angle_error)
+    """
+    inputs, targets = dataset
+    criterion = nn.MSELoss()
+    angle_errors = []
+
+    # Save the original state dict to restore later
+    original_state = copy.deepcopy(model.state_dict())
+
+    for _ in range(n_iter):
+        # Restore original weights before each perturbation
+        model.load_state_dict(original_state)
+        # Add noise perturbation (sample once per evaluation)
+        if noise_std > 0:
+            add_weight_noise(model, noise_st=noise_std)
+        
+        model.eval()
+        total_angle_error = 0
+        count = 0
+        with torch.no_grad():
+            for i in range(0, inputs.size(0), batch_size):
+                x_batch = inputs[i : i + batch_size].to(device)
+                y_batch = targets[i : i + batch_size].to(device)
+                original_deg_batch = original_degree[i : i + batch_size].to(device).cpu().numpy()
+                outputs = model(x_batch)
+                # Use the final time step for output and target angles, after training for specific epochs
+                output_angles = torch.atan2(outputs[:, -1, 0], outputs[:, -1, 1]).cpu().numpy() 
+                output_angles_deg = np.degrees(output_angles)
+                # target_angles = torch.atan2(y_batch[:, -1, 0], y_batch[:, -1, 1]).cpu().numpy()
+                # target_angles_deg = np.degrees(target_angles)
+                # Compute circular absolute difference
+                angle_error = np.abs(output_angles_deg - original_deg_batch) 
+                angle_error = np.minimum(angle_error, 360 - angle_error)
+                total_angle_error += np.sum(angle_error)
+                count += x_batch.size(0)
+        avg_angle_error = total_angle_error / count
+        angle_errors.append(avg_angle_error)
+    
+    # Restore the original model state
+    model.load_state_dict(original_state)
+    
+    return np.mean(angle_errors), np.std(angle_errors)
+
+# Evaluation function over a list of noise conditions, returning a dictionary with results.
+def evaluate_model_with_noise(model, dataset, batch_size, noise_std_list=[0, 0.003], n_iter=10, original_degree=None):
+    results = {}
+    for noise_std in noise_std_list:
+        mean_error, std_error = evaluate_model_with_perturbations(model, dataset, batch_size, noise_std, n_iter=n_iter, original_degree=original_degree)
+        results[noise_std] = {'mean': mean_error, 'std': std_error}
+        print(f"Noise std {noise_std}: Mean Angle Error = {mean_error:.6f}, Std = {std_error:.6f}")
+    return results
 
 def save_model(model, filepath):
     torch.save(model.state_dict(), filepath)
     print(f"Model saved to {filepath}")
 
 def plot_outputs_vs_targets(model, dataset, example_idx=0):
-    """
-    Plot the model outputs abd target outputs over time for a single example 
-    :param model: The trained model.
-    :param dataset: Tuple of (inputs, targets).
-    :param example_idx: Index of the example to plot.
-    """
     inputs, targets = dataset
     model.eval()
-
-    # Select a single example
-    # x_example: from the original input
-    # y_example: from the standard output
-    x_example = inputs[example_idx:example_idx+1].to(device) # shape: (1, seq_len_eval, 2)
-    y_example = targets[example_idx:example_idx+1].to(device) # shape: (1, seq_len_eval, 2)
-
-    # Get model predictions
+    x_example = inputs[example_idx:example_idx+1].to(device)
+    y_example = targets[example_idx:example_idx+1].to(device)
     with torch.no_grad():
         outputs = model(x_example)
-    
-    # Convert to numpy for plotting 
-    x_example = x_example.cpu().numpy().squeeze() # Shape: (seq_len, 2)
-    y_example = y_example.cpu().numpy().squeeze() # Shape: (seq_len, 2)
-    outputs = outputs.cpu().numpy().squeeze() 
-
-    # Plot sin(theta) and cos(theta) over time
-    time_steps = np.arange(x_example.shape[0]) # seq_len is the 
-    plt.figure(figsize=(12, 6)) 
-
-    # Plot sin(theta)
+    x_example = x_example.cpu().numpy().squeeze()
+    y_example = y_example.cpu().numpy().squeeze()
+    outputs = outputs.cpu().numpy().squeeze()
+    time_steps = np.arange(x_example.shape[0])
+    plt.figure(figsize=(12, 6))
     plt.subplot(2, 1, 1)
     plt.plot(time_steps, x_example[:, 0], label='Input sin(theta)', linestyle='--', alpha=0.7)
     plt.plot(time_steps, y_example[:, 0], label='Target sin(theta)', linestyle='-', linewidth=2)
@@ -256,7 +276,6 @@ def plot_outputs_vs_targets(model, dataset, example_idx=0):
     plt.ylabel('sin(theta)')
     plt.title('sin(theta) over Time')
     plt.legend()
-
     plt.subplot(2, 1, 2)
     plt.plot(time_steps, x_example[:, 1], label='Input cos(theta)', linestyle='--', alpha=0.7)
     plt.plot(time_steps, y_example[:, 1], label='Target cos(theta)', linestyle='-', linewidth=2)
@@ -265,54 +284,50 @@ def plot_outputs_vs_targets(model, dataset, example_idx=0):
     plt.ylabel('cos(theta)')
     plt.title('cos(theta) over Time')
     plt.legend()
-
     plt.tight_layout()
-    plt.savefig("outputs_vs_targets_with_input_error_rnn_error.png", dpi=300, bbox_inches="tight")
+    plt.savefig("outputs_vs_targets_with_input_error.png", dpi=300, bbox_inches="tight")
     plt.show()
 
-# Hyperparameters
+# Hyperparameters and Device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 batch_size = 64
 num_samples = 10000
 seq_len = 125
 input_duration = 5
-noise_std = 0.01 # Standard deviation of Gaussian noise for inputs
-weight_noise_std = 0.003 # Standard deviation of Gaussian noise for weights 
+noise_std = 0.01   # Input noise std
+weight_noise_std = 0.003   # Weight noise std for evaluation
 
-# Prepare dataset
-inputs, targets, original_degree_train = generate_dataset(batch_size=batch_size, num_samples=num_samples, seq_len=seq_len, input_duration=input_duration)
+# Prepare training dataset
+inputs, targets, _ = generate_dataset(batch_size=batch_size, num_samples=num_samples, seq_len=seq_len, input_duration=input_duration, noise_std=noise_std)
 dataset = (inputs, targets)
+
+# Prepare evaluation dataset (using a different seq_len if desired)
+inputs_eval, targets_eval, original_degrees_eval = generate_dataset(batch_size=batch_size, num_samples=1000, seq_len=250, input_duration=input_duration, noise_std=noise_std)
+dataset_eval = (inputs_eval, targets_eval)
 
 # Initialize model
 model = VanillaRNN().to(device)
 
-inputs, targets, original_degree_eval = generate_dataset(batch_size=batch_size, num_samples=1000, seq_len=250, input_duration=input_duration)
-dataset_eval = (inputs, targets)
+# Train the model and record evaluation metrics every 50 epochs
+num_epochs = 200
+eval_records = train_model(model=model, dataset=dataset, batch_size=batch_size, num_epchos=num_epochs, learning_rate=1e-3, record_interval=10, eval_dataset=dataset_eval, original_degrees=original_degrees_eval)
 
-# Train model 
-eval_records = train_model(model=model, dataset=dataset, batch_size=batch_size, num_epchos=200, learning_rate=1e-3, eval_dataset=dataset_eval)  
-
-# plot model outputs vs targets for a single example
+# Plot model outputs vs targets for a single example
 plot_outputs_vs_targets(model, dataset_eval, example_idx=0)
 
+# Convert evaluation records to DataFrame and plot with seaborn
 df = pd.DataFrame(eval_records)
 print(df.head())
 
 sns.set(style="whitegrid")
 plt.figure(figsize=(8, 6))
-ax = sns.lineplot(data=df, x='epoch', y='angle_error', hue='noise_std', marker='o')
+# Plot mean angle error vs epoch, with error bars showing the standard deviation.
+ax = sns.lineplot(data=df, x='epoch', y='mean_angle_error', hue='noise_std', marker='o')
+ax.errorbar(df['epoch'], df['mean_angle_error'], yerr=df['std_angle_error'], fmt='none', capsize=5, color='black')
 ax.set_title("Angle Error vs Training Epochs")
 ax.set_xlabel("Epoch")
 ax.set_ylabel("Average Angle Error (degrees)")
-plt.savefig("angle_error_plot_with_input_error_rnn_error.png", dpi=300, bbox_inches="tight")
+plt.savefig("angle_error_plot_with_input_error.png", dpi=300, bbox_inches="tight")
 plt.show()
 
-# inputs, targets = generate_dataset(batch_size=batch_size, num_samples=1000, seq_len=500, input_duration=input_duration)
-# dataset_eval = (inputs, targets)
-# eva_ seq_len = 250+ 
-# num_samples 1000 
-# Evaluate model with weight noise
-# evaluate_model_with_noise(model, dataset, batch_size=batch_size, noise_std=weight_noise_std) 
-
-save_model(model, "/Users/yakunfang/Desktop/Ring_attractor/trained_model_with_input_error_rnn_error_200epchos.pth")
-    
+save_model(model, "trained_model_with_input_error_200epochs.pth")
