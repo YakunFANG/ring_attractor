@@ -8,6 +8,10 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import os 
 import copy 
+from torch.nn import init
+from torch.nn import functional as F
+import math 
+import time
 
 # Dataset Generation 
 def generate_dataset(batch_size=64, num_samples=1000, seq_len=250, input_duration=5, noise_std=0.01):
@@ -26,7 +30,7 @@ def generate_dataset(batch_size=64, num_samples=1000, seq_len=250, input_duratio
 
     for _ in range(num_samples):
         # Random angle theta (original angle value)
-        theta = np.random.uniform(0, 2 * np.pi)
+        theta = np.random.uniform(-np.pi, np.pi)
         theta_degree = np.degrees(theta)
         sin_cos = np.array([np.sin(theta), np.cos(theta)])
         
@@ -51,12 +55,121 @@ def generate_dataset(batch_size=64, num_samples=1000, seq_len=250, input_duratio
         torch.tensor(original_degrees, dtype=torch.float32),
     )
 
+# Continuous-time RNN
+class CTRNN(nn.Module):
+    """Continuous-time RNN.
+    Parameters:
+        input_size: Number of input neurons
+        hidden_size: Number of hidden neurons
+        dt: discretization time step in ms.
+            If None, dt equals time constant tau
+
+    Inputs:
+        input: tensor of shape (seq_len, batch, input_size)
+        hidden: tensor of shape (batch, hidden_size), initial hidden activity
+             if None, hidden is initialized through self.init_hidden()
+    
+    Outputs:
+        output: tensor of shape (seq_len, batch, hidden_size)
+        hidden: tensor of shape (batch, hidden_size), final hidden activity
+    """
+
+    def __init__(self, input_size, hidden_size, dt=10, **kwargs):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.tau = 100
+        if dt is None:
+            alpha = 1
+        else:
+            alpha = dt / self.tau
+        self.alpha = alpha
+
+        self.input2h = nn.Linear(input_size, hidden_size)
+        self.h2h = nn.Linear(hidden_size, hidden_size)
+
+    def init_hidden(self, input_shape):
+        batch_size = input_shape[1]
+        # print("the batch size is", batch_size)
+        return torch.zeros(batch_size, self.hidden_size)
+    
+    def recurrence(self, input, hidden):
+        """Run network for one time step.
+
+        Inputs:
+            input: tensor of shape (batch, input_size)
+            hidden: tensor of shape (batch, hidden_size)
+
+        Outputs: 
+             h_new: tensor of shape (batch, hidden_size).
+                network activity at the next time step
+        """
+        # print("the size of input before h_new is", input.shape)
+        # print("the hidden size current is", hidden.shape)
+        h_new = torch.relu(self.input2h(input) + self.h2h(hidden))
+        h_new = hidden * (1 - self.alpha) + h_new * self.alpha
+        return h_new 
+
+    def forward(self, input, hidden=None):
+        """Propogate input through the network."""
+
+        # If hidden activity is not provided, initialize it
+        if hidden is None:
+            hidden = self.init_hidden(input.shape).to(input.device)
+        
+        # Loop through time
+        output = []
+        steps = range(input.size(0))
+        #print("the shape of input is !!!!", input.shape)
+        for i in steps:
+
+            #print("the size of the input[i] is", input[i].shape)
+            #print("the shape of hidden is", hidden.shape)
+
+            hidden = self.recurrence(input[i], hidden)
+            output.append(hidden)
+        
+        # Stack together output from all time steps
+        output = torch.stack(output, dim=0) # (seq_len, batch, hidden_size)
+        return output, hidden 
+
+class RNNNet(nn.Module):
+    """Recurrent neiwork model.
+
+    Parameters:
+        input_size: int, input size
+        hidden_size: int, hidden size
+        output_size: int, output size
+
+    Inputs:
+        x: tensor of shape (Seq Len, Batch, Input size)
+
+    Outputs:
+        out: tensor of shape (Seq Len, Batch, Output size)
+        rnn_output: tensor of shape (Seq Len, Batch, Hidden size)
+    """
+    def __init__(self, input_size, hidden_size, output_size, **kwargs):
+        super().__init__()
+
+        # Continuous time RNN
+        self.rnn = CTRNN(input_size, hidden_size, **kwargs)
+
+        # Add an output layer
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        rnn_output, _ = self.rnn(x)
+        out = self.fc(rnn_output)
+        return out, rnn_output
+
+
+"""
 # RNN Model
 class VanillaRNN(nn.Module):
     def __init__(self, input_size=2, hidden_size=300, output_size=2, recurrent_noise_std=0.01):
         super(VanillaRNN, self).__init__()
         self.hidden_size = hidden_size
-        # self.recurrent_noise_std = recurrent_noise_std
+        # self.recurrent_noise_std = recurrent_noise_std 
         self.rnn_cell = nn.RNNCell(input_size, hidden_size, nonlinearity="relu")
         self.output_layer = nn.Linear(hidden_size, output_size)
 
@@ -68,18 +181,19 @@ class VanillaRNN(nn.Module):
             h = self.rnn_cell(x[:, t], h)
             # Add Gaussian noise to the hidden state if specified
             #if self.recurrent_noise_std > 0:
-            #    noise = torch.randn_like(h) * self.recurrent_noise_std
-            #    h = h + noise 
+            #   noise = torch.randn_like(h) * self.recurrent_noise_std
+            #   h = h + noise 
             outputs.append(self.output_layer(h))
         return torch.stack(outputs, dim=1)
-    
+"""
+
 # Function to add Gaussian noise to model weights
 def add_weight_noise(model, noise_st):
-    """
-    Add Gaussian noise to the model weights.
-    :param model: The model whose weights will be perturbed
-    :param noise_std: Standard deviation of the Gaussian noise
-    """
+    
+    #Add Gaussian noise to the model weights.
+    #:param model: The model whose weights will be perturbed
+    #:param noise_std: Standard deviation of the Gaussian noise
+    
     # in pytorch, a model's weights (parameters) are stored as torch.Tensor objects
     # we can access all the parameters using model.parameters(), which includes the weights of the RNN cells and the weights of the output layer or biases 
     # Gaussian noise is generated using torch.randn_like, whcih creates a tensor of teh same shape as the input tensor
@@ -91,29 +205,36 @@ def add_weight_noise(model, noise_st):
             param.add_(noise)
 
 # Training Function
-def train_model(model, dataset, batch_size, num_epchos, learning_rate=1e-3, record_interval=10, eval_dataset=None, original_degrees=None):
-    inputs, targets = dataset
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.MSELoss()
+def train_model(model, dataset, batch_size, num_epchos, learning_rate=1e-3, record_interval=10, eval_dataset=None, original_degrees=None): 
+    inputs, targets = dataset 
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate) 
+    criterion = nn.MSELoss() 
     eval_records = []
-
-    for epcho in range(num_epchos):
-        model.train()
-        permutation = torch.randperm(inputs.size(0))
+    
+    start_time = time.time()
+    for epcho in range(num_epchos): 
+        model.train()  
+        permutation = torch.randperm(inputs.size(0))  
         inputs = inputs[permutation]
         targets = targets[permutation]
         epoch_loss = 0
         for i in range(0, inputs.size(0), batch_size):
             x_batch = inputs[i : i + batch_size].to(device)
             y_batch = targets[i : i + batch_size].to(device)
+            # breakpoint() 
+            # print("the shape of targets is", y_batch.shape) 
             optimizer.zero_grad()
-            outputs = model(x_batch)
+            x_batch = torch.transpose(x_batch, 0, 1)
+            # print("shape of the x_batch is", x_batch.shape)
+            outputs, _ = model(x_batch)
+            outputs = torch.transpose(outputs, 0, 1)
+            # print("the shape of the outputs is", outputs.shape)
             loss = criterion(outputs, y_batch)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
-        avg_loss = epoch_loss / (inputs.size(0) // batch_size)
-        print(f"Epoch {epcho + 1}/{num_epchos}, Loss: {avg_loss:.6f}")
+        # avg_loss = epoch_loss / (inputs.size(0) // batch_size)
+        print(f"Epoch {epcho + 1}/{num_epchos}, Loss: {epoch_loss:.6f}, Time: {(time.time() - start_time):.1f}")
 
         # Evaluate every record_interval epochs if eval_dataset is provided
         if eval_dataset is not None and (epcho + 1) % record_interval == 0:
@@ -223,13 +344,13 @@ def evaluate_model_with_perturbations(model, dataset, batch_size, noise_std, n_i
             for i in range(0, inputs.size(0), batch_size):
                 x_batch = inputs[i : i + batch_size].to(device)
                 y_batch = targets[i : i + batch_size].to(device)
+                x_batch = torch.transpose(x_batch, 0, 1)
                 original_deg_batch = original_degree[i : i + batch_size].to(device).cpu().numpy()
-                outputs = model(x_batch)
+                outputs, _ = model(x_batch)
+                outputs = torch.transpose(outputs, 0, 1)
                 # Use the final time step for output and target angles, after training for specific epochs
                 output_angles = torch.atan2(outputs[:, -1, 0], outputs[:, -1, 1]).cpu().numpy() 
-                output_angles_deg = np.degrees(output_angles)
-                # target_angles = torch.atan2(y_batch[:, -1, 0], y_batch[:, -1, 1]).cpu().numpy()
-                # target_angles_deg = np.degrees(target_angles)
+                output_angles_deg = np.degrees(output_angles) 
                 # Compute circular absolute difference
                 angle_error = np.abs(output_angles_deg - original_deg_batch) 
                 angle_error = np.minimum(angle_error, 360 - angle_error)
@@ -261,8 +382,10 @@ def plot_outputs_vs_targets(model, dataset, example_idx=0):
     model.eval()
     x_example = inputs[example_idx:example_idx+1].to(device)
     y_example = targets[example_idx:example_idx+1].to(device)
+    x_example = torch.transpose(x_example, 0, 1)
     with torch.no_grad():
-        outputs = model(x_example)
+        outputs, _= model(x_example)
+    outputs = torch.transpose(outputs, 0, 1)
     x_example = x_example.cpu().numpy().squeeze()
     y_example = y_example.cpu().numpy().squeeze()
     outputs = outputs.cpu().numpy().squeeze()
@@ -285,8 +408,9 @@ def plot_outputs_vs_targets(model, dataset, example_idx=0):
     plt.title('cos(theta) over Time')
     plt.legend()
     plt.tight_layout()
-    plt.savefig("outputs_vs_targets_with_input_error.png", dpi=300, bbox_inches="tight")
+    plt.savefig("outputs_vs_targets_with_input_noise.png", dpi=300, bbox_inches="tight") 
     plt.show()
+
 
 # Hyperparameters and Device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -306,7 +430,7 @@ inputs_eval, targets_eval, original_degrees_eval = generate_dataset(batch_size=b
 dataset_eval = (inputs_eval, targets_eval)
 
 # Initialize model
-model = VanillaRNN().to(device)
+model = RNNNet(input_size=2, hidden_size=300, output_size=2).to(device)
 
 # Train the model and record evaluation metrics every 50 epochs
 num_epochs = 200
@@ -315,6 +439,7 @@ eval_records = train_model(model=model, dataset=dataset, batch_size=batch_size, 
 # Plot model outputs vs targets for a single example
 plot_outputs_vs_targets(model, dataset_eval, example_idx=0)
 
+# breakpoint()
 # Convert evaluation records to DataFrame and plot with seaborn
 df = pd.DataFrame(eval_records)
 print(df.head())
@@ -327,7 +452,32 @@ ax.errorbar(df['epoch'], df['mean_angle_error'], yerr=df['std_angle_error'], fmt
 ax.set_title("Angle Error vs Training Epochs")
 ax.set_xlabel("Epoch")
 ax.set_ylabel("Average Angle Error (degrees)")
-plt.savefig("angle_error_plot_with_input_error.png", dpi=300, bbox_inches="tight")
+plt.savefig("angle_error_plot_with_input_noise.png", dpi=300, bbox_inches="tight")
 plt.show()
 
-save_model(model, "trained_model_with_input_error_200epochs.pth")
+save_model(model, "trained_model_with_input_noise_200epochs.pth")
+
+
+"""
+# Specify the cpu 
+device = "cpu"
+
+# Load the trained checkpoint 
+checkpoint = torch.load('trained_model_original_200epochs.pth')
+
+# Initialize the model
+model = RNNNet(input_size=2, hidden_size=300, output_size=2).to(device)
+
+# Load the checkpoints from the saved file
+model.load_state_dict(checkpoint)
+
+# Access all parameters
+for name, param in model.named_parameters():
+    if param.requires_grad:  # Only look at trainable parameters
+        print(f"Parameter name: {name}")
+        print(f"Weight shape: {param.shape}")
+        print(f"Weight values:\n{param.data}\n")
+"""
+
+
+
