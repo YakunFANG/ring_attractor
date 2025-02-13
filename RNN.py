@@ -39,8 +39,8 @@ def generate_dataset(batch_size=64, num_samples=1000, seq_len=250, input_duratio
         input_sequence[0] = sin_cos
 
         # Add Gaussian noise to the input
-        noise = np.random.normal(0, noise_std, 2)
-        input_sequence[0] += noise
+        noise = np.random.normal(0, noise_std, (seq_len, 2))
+        input_sequence += noise 
         
         # Target: Maintain the same sin_cos for the entire sequence
         target_sequence = np.tile(sin_cos, (seq_len, 1))
@@ -457,13 +457,12 @@ plt.show()
 
 save_model(model, "trained_model_with_input_noise_200epochs.pth")
 
-
 """
 # Specify the cpu 
 device = "cpu"
 
 # Load the trained checkpoint 
-checkpoint = torch.load('trained_model_original_200epochs.pth')
+checkpoint = torch.load('trained_model_with_input_noise_200epochs.pth')
 
 # Initialize the model
 model = RNNNet(input_size=2, hidden_size=300, output_size=2).to(device)
