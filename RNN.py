@@ -39,11 +39,12 @@ def generate_dataset(batch_size=64, num_samples=1000, seq_len=250, input_duratio
         input_sequence[0] = sin_cos
 
         # Add Gaussian noise to the input
-        noise = np.random.normal(0, noise_std, (seq_len, 2))
-        input_sequence += noise 
+        # noise = np.random.normal(0, noise_std, (seq_len, 2))
+        # input_sequence += noise 
         
         # Target: Maintain the same sin_cos for the entire sequence
         target_sequence = np.tile(sin_cos, (seq_len, 1))
+        target_sequence[0] = [0, 0]
 
         inputs.append(input_sequence)
         targets.append(target_sequence)
@@ -78,6 +79,8 @@ class CTRNN(nn.Module):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
+        # Add rnn noise
+        # self.recurrent_noise_std = 0.01
         self.tau = 100
         if dt is None:
             alpha = 1
@@ -127,6 +130,10 @@ class CTRNN(nn.Module):
             #print("the shape of hidden is", hidden.shape)
 
             hidden = self.recurrence(input[i], hidden)
+            # Add rnn noise
+            # noise = torch.randn_like(hidden) * self.recurrent_noise_std
+            # hidden = hidden + noise 
+
             output.append(hidden)
         
         # Stack together output from all time steps
@@ -205,14 +212,20 @@ def add_weight_noise(model, noise_st):
             param.add_(noise)
 
 # Training Function
-def train_model(model, dataset, batch_size, num_epchos, learning_rate=1e-3, record_interval=10, eval_dataset=None, original_degrees=None): 
+def train_model(model, dataset, batch_size, learning_rate=1e-3, record_interval=20, eval_dataset=None, original_degrees=None): 
     inputs, targets = dataset 
     optimizer = optim.Adam(model.parameters(), lr=learning_rate) 
     criterion = nn.MSELoss() 
     eval_records = []
     
     start_time = time.time()
-    for epcho in range(num_epchos): 
+    loss_container = []
+    
+    whether_complete = 0
+    epcho = 0
+    max_iteration = 5000
+    
+    while whether_complete == 0 and (epcho+1) <= max_iteration: 
         model.train()  
         permutation = torch.randperm(inputs.size(0))  
         inputs = inputs[permutation]
@@ -234,12 +247,13 @@ def train_model(model, dataset, batch_size, num_epchos, learning_rate=1e-3, reco
             optimizer.step()
             epoch_loss += loss.item()
         # avg_loss = epoch_loss / (inputs.size(0) // batch_size)
-        print(f"Epoch {epcho + 1}/{num_epchos}, Loss: {epoch_loss:.6f}, Time: {(time.time() - start_time):.1f}")
+        print(f"Epoch {epcho + 1}, Loss: {epoch_loss:.6f}, Time: {(time.time() - start_time):.1f}")
 
         # Evaluate every record_interval epochs if eval_dataset is provided
-        if eval_dataset is not None and (epcho + 1) % record_interval == 0:
+        if eval_dataset is not None and (epcho + 1) % 10 == 0:
             # Evaluate for each noise condition separately
             eval_results = evaluate_model_with_noise(model, eval_dataset, batch_size, noise_std_list=[0, weight_noise_std], original_degree=original_degrees)
+            #print("the eval_results.items() are", eval_results.items())
             for noise_std, stats in eval_results.items():
                 eval_records.append({
                     'epoch': epcho + 1,
@@ -247,6 +261,21 @@ def train_model(model, dataset, batch_size, num_epchos, learning_rate=1e-3, reco
                     'mean_angle_error': stats['mean'],
                     'std_angle_error': stats['std']
                 })
+            
+            loss_container.append(stats['loss'])
+
+
+        if len(loss_container) == 20:
+            whether_complete = 1
+            criteria = loss_container[0]
+            for loss_value in loss_container:
+                if loss_value < criteria:
+                    whether_complete = 0
+                    print("the current 20 loss values are", loss_container)
+                    loss_container.pop(0)
+                    break 
+        
+        epcho += 1
     
     return eval_records
 
@@ -330,7 +359,10 @@ def evaluate_model_with_perturbations(model, dataset, batch_size, noise_std, n_i
     # Save the original state dict to restore later
     original_state = copy.deepcopy(model.state_dict())
 
+    total_loss = []
+
     for _ in range(n_iter):
+        current_total_loss = 0 
         # Restore original weights before each perturbation
         model.load_state_dict(original_state)
         # Add noise perturbation (sample once per evaluation)
@@ -340,6 +372,7 @@ def evaluate_model_with_perturbations(model, dataset, batch_size, noise_std, n_i
         model.eval()
         total_angle_error = 0
         count = 0
+
         with torch.no_grad():
             for i in range(0, inputs.size(0), batch_size):
                 x_batch = inputs[i : i + batch_size].to(device)
@@ -348,6 +381,10 @@ def evaluate_model_with_perturbations(model, dataset, batch_size, noise_std, n_i
                 original_deg_batch = original_degree[i : i + batch_size].to(device).cpu().numpy()
                 outputs, _ = model(x_batch)
                 outputs = torch.transpose(outputs, 0, 1)
+
+                loss = criterion(outputs, y_batch)
+                current_total_loss += loss
+
                 # Use the final time step for output and target angles, after training for specific epochs
                 output_angles = torch.atan2(outputs[:, -1, 0], outputs[:, -1, 1]).cpu().numpy() 
                 output_angles_deg = np.degrees(output_angles) 
@@ -356,21 +393,25 @@ def evaluate_model_with_perturbations(model, dataset, batch_size, noise_std, n_i
                 angle_error = np.minimum(angle_error, 360 - angle_error)
                 total_angle_error += np.sum(angle_error)
                 count += x_batch.size(0)
+        
+        total_loss.append(current_total_loss)
         avg_angle_error = total_angle_error / count
         angle_errors.append(avg_angle_error)
     
     # Restore the original model state
     model.load_state_dict(original_state)
     
-    return np.mean(angle_errors), np.std(angle_errors)
+    return np.mean(angle_errors), np.std(angle_errors), np.mean(total_loss)
 
 # Evaluation function over a list of noise conditions, returning a dictionary with results.
 def evaluate_model_with_noise(model, dataset, batch_size, noise_std_list=[0, 0.003], n_iter=10, original_degree=None):
     results = {}
+    #breakpoint()
     for noise_std in noise_std_list:
-        mean_error, std_error = evaluate_model_with_perturbations(model, dataset, batch_size, noise_std, n_iter=n_iter, original_degree=original_degree)
-        results[noise_std] = {'mean': mean_error, 'std': std_error}
+        mean_error, std_error, loss_eval = evaluate_model_with_perturbations(model, dataset, batch_size, noise_std, n_iter=n_iter, original_degree=original_degree)
+        results[noise_std] = {'mean': mean_error, 'std': std_error, 'loss': loss_eval}
         print(f"Noise std {noise_std}: Mean Angle Error = {mean_error:.6f}, Std = {std_error:.6f}")
+    #print("the current results are:", results)
     return results
 
 def save_model(model, filepath):
@@ -408,7 +449,84 @@ def plot_outputs_vs_targets(model, dataset, example_idx=0):
     plt.title('cos(theta) over Time')
     plt.legend()
     plt.tight_layout()
-    plt.savefig("outputs_vs_targets_with_input_noise.png", dpi=300, bbox_inches="tight") 
+    plt.savefig("outputs_vs_targets_original.png", dpi=300, bbox_inches="tight") 
+    plt.show()
+
+def generate_representation_matrix(model, network_name, num_angles=360, seq_len=3000):
+    """
+    Generate a representation matrix for the given model.
+    :param model: The trained model. 
+    :param num_angles: Number of angles to sample.
+    :param seq_len: Length of each sequence (time steps).
+    :return Representation matrix of shape [N, M], where N is the number of neurons and M is the number of angles. 
+    """
+    model.eval()
+    # angles = np.linspace(0, 2 * np.pi, num_angles)
+    # representation_matrix = []
+    # count = 0
+    
+    # Change the codes to make the input can be put in only one batch
+    # sin_cos = np.array([np.sin(theta), np.cos(theta)])
+    # input_sequence = np.zeros((seq_len, 2))
+    # input_sequence[0] = sin_cos
+    # input_tensor = torch.tensor(input_sequence, dtype=torch.float32).unsqueeze(1).to(device)
+    input_tensor, target_tensor, _ = generate_dataset(batch_size=360, num_samples=num_angles, seq_len=3000, input_duration=input_duration, noise_std=noise_std)
+    
+    input_tensor = torch.transpose(input_tensor, 0, 1) 
+    
+    with torch.no_grad():
+        _, rnn_output = model(input_tensor)
+        # print("the shape of rnn_output is", rnn_output.shape)
+        final_activity = rnn_output[-1].cpu().numpy()
+        # print("the current final activity is", len(final_activity[0])) 
+        # representation_matrix.append(final_activity)
+    # print(f"Processing model: {network_name}, angle: {theta}, index: {count}")
+    
+    # print("the shape of representation matrix is", representation_matrix.size) 
+    representation_matrix = np.array(final_activity).T 
+    
+    # print("the shape of it is", representation_matrix.shape)
+
+    return representation_matrix 
+
+def participation_ratio(representation_matrix):
+    """
+    Compute the participation ratio of the representation matrix.
+    :param representation_matrix: Representation matrix of shape [N, M]
+    :param return Participation ratio
+    """
+    cov_matrix = np.cov(representation_matrix)
+    eigenvalues = np.linalg.eigvalsh(cov_matrix)
+    participation_ratio = np.sum(eigenvalues) ** 2 / np.sum(eigenvalues ** 2)
+    return participation_ratio
+
+def visualize_representation_matrices(representation_matrices, title, network_names):
+    """
+    Visulaize the representation matrix using PCA.
+    :param representation_matrix: Representation matrix of shape [N, M].
+    :param param title: Title for the plot.
+    """
+    from sklearn.decomposition import PCA
+
+    pca = PCA(n_components=3)
+    reduced_matrices = [pca.fit_transform(matrix.T) for matrix in representation_matrices]
+
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    colors = ['r', 'g', 'b']
+
+    for i, reduced_matrix in enumerate(reduced_matrices):
+        ax.scatter(reduced_matrix[:, 0], reduced_matrix[:, 1], reduced_matrix[:, 2], color=colors[i], label=network_names[i], alpha=0.7)
+    
+    
+    ax.set_title(title)
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.set_zlabel("PC3")
+    ax.legend()
+
+    plt.savefig("representation_matrices.png", dpi=300, bbox_inches="tight")
     plt.show()
 
 
@@ -421,6 +539,7 @@ input_duration = 5
 noise_std = 0.01   # Input noise std
 weight_noise_std = 0.003   # Weight noise std for evaluation
 
+"""
 # Prepare training dataset
 inputs, targets, _ = generate_dataset(batch_size=batch_size, num_samples=num_samples, seq_len=seq_len, input_duration=input_duration, noise_std=noise_std)
 dataset = (inputs, targets)
@@ -433,11 +552,10 @@ dataset_eval = (inputs_eval, targets_eval)
 model = RNNNet(input_size=2, hidden_size=300, output_size=2).to(device)
 
 # Train the model and record evaluation metrics every 50 epochs
-num_epochs = 200
-eval_records = train_model(model=model, dataset=dataset, batch_size=batch_size, num_epchos=num_epochs, learning_rate=1e-3, record_interval=10, eval_dataset=dataset_eval, original_degrees=original_degrees_eval)
+eval_records = train_model(model=model, dataset=dataset, batch_size=batch_size, learning_rate=1e-3, record_interval=10, eval_dataset=dataset_eval, original_degrees=original_degrees_eval)
 
 # Plot model outputs vs targets for a single example
-plot_outputs_vs_targets(model, dataset_eval, example_idx=0)
+plot_outputs_vs_targets(model, dataset_eval, example_idx=0) 
 
 # breakpoint()
 # Convert evaluation records to DataFrame and plot with seaborn
@@ -452,31 +570,120 @@ ax.errorbar(df['epoch'], df['mean_angle_error'], yerr=df['std_angle_error'], fmt
 ax.set_title("Angle Error vs Training Epochs")
 ax.set_xlabel("Epoch")
 ax.set_ylabel("Average Angle Error (degrees)")
-plt.savefig("angle_error_plot_with_input_noise.png", dpi=300, bbox_inches="tight")
+plt.savefig("angle_error_plot_original.png", dpi=300, bbox_inches="tight")
 plt.show()
 
-save_model(model, "trained_model_with_input_noise_200epochs.pth")
+save_model(model, "trained_model_original_200epochs.pth")
 
 """
-# Specify the cpu 
-device = "cpu"
+
+# Task 1: Evaluate the Performance with Random Weight Noise
+# Generate the test datasets
+inputs_test, targets_test, original_degrees_test = generate_dataset(batch_size = batch_size, num_samples=1000, seq_len=250, input_duration=input_duration, noise_std=noise_std)
+dataset_test = (inputs_test, targets_test)
 
 # Load the trained checkpoint 
-checkpoint = torch.load('trained_model_with_input_noise_200epochs.pth')
-
+checkpoint1 = torch.load('trained_model_original_200epochs.pth')
+checkpoint2 = torch.load('trained_model_with_input_noise_200epochs.pth')
+checkpoint3 = torch.load('trained_model_with_input_noise_rnn_noise_200epochs.pth')
 # Initialize the model
-model = RNNNet(input_size=2, hidden_size=300, output_size=2).to(device)
-
+model1 = RNNNet(input_size=2, hidden_size=300, output_size=2).to(device)
+model2 = RNNNet(input_size=2, hidden_size=300, output_size=2).to(device)
+model3 = RNNNet(input_size=2, hidden_size=300, output_size=2).to(device)
 # Load the checkpoints from the saved file
-model.load_state_dict(checkpoint)
+model1.load_state_dict(checkpoint1)
+model2.load_state_dict(checkpoint2)
+model3.load_state_dict(checkpoint3)
 
-# Access all parameters
-for name, param in model.named_parameters():
-    if param.requires_grad:  # Only look at trainable parameters
-        print(f"Parameter name: {name}")
-        print(f"Weight shape: {param.shape}")
-        print(f"Weight values:\n{param.data}\n")
 """
+# Evaluate the model with varying weight noise
+noise_std_list = [0, 0.003, 0.01, 0.03]
+test_results_1 = evaluate_model_with_noise(model1, dataset_test, batch_size, noise_std_list, n_iter=10, original_degree=original_degrees_test)
+test_results_2 = evaluate_model_with_noise(model2, dataset_test, batch_size, noise_std_list, n_iter=10, original_degree=original_degrees_test)
+test_results_3 = evaluate_model_with_noise(model3, dataset_test, batch_size, noise_std_list, n_iter=10, original_degree=original_degrees_test)
+# Access all parameters
+# for name, param in model.named_parameters():
+#    if param.requires_grad:  # Only look at trainable parameters
+#        print(f"Parameter name: {name}")
+#        print(f"Weight shape: {param.shape}")
+#        print(f"Weight values:\n{param.data}\n")
+
+# Convert test results to DataFrame and plot with seaborn
+# breakpoint()
+df_test1 = pd.DataFrame(test_results_1).T.reset_index()
+df_test1.columns = ['noise_std', 'mean_angle_error', 'std_angle_error', 'loss']
+df_test2 = pd.DataFrame(test_results_2).T.reset_index()
+df_test2.columns = ['noise_std', 'mean_angle_error', 'std_angle_error', 'loss']
+df_test3 = pd.DataFrame(test_results_3).T.reset_index()
+df_test3.columns = ['noise_std', 'mean_angle_error', 'std_angle_error', 'loss']
+#print(df_test.shape)
+#print(df_test['mean_angle_error'].shape)
+#print(df_test['std_angle_error'].shape)
+#print(df_test)
+import pandas as pd
+
+# Add a 'network' column to each DataFrame
+df_test1['network'] = 'Original'
+df_test2['network'] = 'Input_error'
+df_test3['network'] = 'Input_error&Rnn_error'
+
+# Combine the DataFrames
+df_combined = pd.concat([df_test1, df_test2, df_test3], ignore_index=True)
+
+# Print the combined DataFrame
+print(df_combined)
+
+# Define colors for each network
+colors = ['skyblue', 'lightgreen', 'salmon']
+networks = df_combined['network'].unique()
+
+# Create the plot
+plt.figure(figsize=(10, 6))
+
+# Plot bars for each network
+x = np.arange(len(df_test1))  # X-axis positions
+width = 0.2  # Width of each bar
+
+for i, network in enumerate(networks):
+    df_network = df_combined[df_combined['network'] == network]
+    plt.bar(x + i * width, df_network['mean_angle_error'], width, yerr=df_network['std_angle_error'], 
+            capsize=5, label=network, color=colors[i])
+
+# Customize the plot
+plt.xticks(x + width, df_test1['noise_std'])
+plt.title("Angle Error vs Weight Noise Std (Comparison of Three Networks)")
+plt.xlabel("Weight Noise Std")
+plt.ylabel("Average Angle Error (degrees)")
+plt.legend(title='Network')
+plt.savefig("angle_error_vs_weight_noise_combined.png", dpi=300, bbox_inches="tight")
+plt.show()
+"""
+
+network_names=['Original', 'Input_noise', 'Input_noise_Rnn_noise']
+print("executing task 2")
+# Task 2: generate representation matrix for the trained model
+representation_matrix1 = generate_representation_matrix(model1, network_names[0])
+# breakpoint()
+# print("shape of it", len(representation_matrix1[0]))
+representation_matrix2 = generate_representation_matrix(model2, network_names[1])
+representation_matrix3 = generate_representation_matrix(model3, network_names[2])
+
+participation_ratio_1=participation_ratio(representation_matrix1)
+participation_ratio_2=participation_ratio(representation_matrix2)
+participation_ratio_3=participation_ratio(representation_matrix3)
+
+print(f"Participation Ratio for original: {participation_ratio_1}")
+print(f"Participation Ratio for input_error: {participation_ratio_2}")
+print(f"Participation Ratio for input_error&rnn_error: {participation_ratio_3}")
+
+# Visualize the representation matrices in 3D
+visualize_representation_matrices(
+    [representation_matrix1, representation_matrix2, representation_matrix3], title="Representation matrices in 3D",
+    network_names=[f"Original_PR_{participation_ratio_1}", f"Input_noise_PR_{participation_ratio_2}", f"Input_noise_Rnn_noise_PR_{participation_ratio_3}"]
+)
+
+
+
 
 
 
