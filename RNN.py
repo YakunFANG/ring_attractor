@@ -452,7 +452,7 @@ def plot_outputs_vs_targets(model, dataset, example_idx=0):
     plt.savefig("outputs_vs_targets_original.png", dpi=300, bbox_inches="tight") 
     plt.show()
 
-def generate_representation_matrix(model, network_name, num_angles=360, seq_len=3000):
+def generate_representation_matrix(model, network_name, num_angles=360, seq_len=40000):
     """
     Generate a representation matrix for the given model.
     :param model: The trained model. 
@@ -470,7 +470,7 @@ def generate_representation_matrix(model, network_name, num_angles=360, seq_len=
     # input_sequence = np.zeros((seq_len, 2))
     # input_sequence[0] = sin_cos
     # input_tensor = torch.tensor(input_sequence, dtype=torch.float32).unsqueeze(1).to(device)
-    input_tensor, target_tensor, _ = generate_dataset(batch_size=360, num_samples=num_angles, seq_len=3000, input_duration=input_duration, noise_std=noise_std)
+    input_tensor, target_tensor, _ = generate_dataset(batch_size=360, num_samples=num_angles, seq_len=seq_len, input_duration=input_duration, noise_std=noise_std)
     
     input_tensor = torch.transpose(input_tensor, 0, 1) 
     
@@ -488,6 +488,68 @@ def generate_representation_matrix(model, network_name, num_angles=360, seq_len=
     # print("the shape of it is", representation_matrix.shape)
 
     return representation_matrix 
+
+# Capture the activity of the RNN at each time step for each angle.
+def generate_representation_matrix_evaluate(model, network_name, num_angles=360, seq_len=40000):
+    """
+    Generate a representation matrix for the given model. 
+    :param model: The trained model. 
+    :param num_angles: Number of angles to sample. 
+    :param seq_len: Length of each sequence (time steps). 
+    :return Representation matrix of shape [N, M], where N is the number of neurons and M is the number of angles. 
+    """
+    model.eval()
+    input_tensor, target_tensor, _ = generate_dataset(batch_size=num_angles, num_samples=num_angles, seq_len=seq_len, input_duration=input_duration, noise_std=noise_std)
+
+    input_tensor = torch.transpose(input_tensor, 0, 1)
+
+    with torch.no_grad():
+        _, rnn_output = model(input_tensor)
+        # rnn_output shape: (seq_len, batch_size, hidden_size)
+        # We want to capture the activity over time for each angle
+        # Shape: (seq_len, num_angles, hidden_size) 
+        activity_over_time = rnn_output.cpu().numpy()
+
+    return activity_over_time 
+
+# Visualize the activity over time for each angle. 
+# We will create a new function to visualize the activity OVER TIME for each angle using PCA. 
+def visualize_activity_over_time(activity_over_time, angle_idx, title):
+    """
+    Visualize the activity over time for a specific angle using PCA.
+    :param activity_over_time: Activity over time for all angles, shape (seq_len, num_angles, hidden_size)
+    :param angle_idx: Index of the angles to visualize.
+    :param title: Title for the plot.
+    """
+    from sklearn.decomposition import PCA
+
+    # Extract the activity for the specific angle
+    # Shape: (seq_len, hidden_size)
+    angle_activity = activity_over_time[:, angle_idx, :]
+
+    # Apply PCA to reduce to 3 dimensions
+    pca = PCA(n_components=3)
+    # Shape: (seq_len, 3)
+    reduced_activity = pca.fit_transform(angle_activity)
+
+    # Create a time axis (assuming time steps are sequential)
+    time_steps = np.arange(reduced_activity.shape[0])
+
+    # Plot the three principal components over time
+    plt.figure(figsize=(10, 6))
+    plt.plot(time_steps, reduced_activity[:, 0], label="PC1", color="b", alpha=0.8)
+    plt.plot(time_steps, reduced_activity[:, 1], label="PC2", color="g", alpha=0.8)
+    plt.plot(time_steps, reduced_activity[:, 2], label="PC3", color="r", alpha=0.8)
+
+    plt.xlabel("Time Steps")
+    plt.ylabel("PCA Component Value")
+    plt.title(f"{title} (Angle {angle_idx}) - 2D PCA Line Plot")
+    plt.legend()
+    plt.grid(True)
+
+    plt.savefig(f"activity_over_time_angle_{angle_idx}_{title}_2D.png", dpi=300, bbox_inches="tight")
+    plt.show()
+
 
 def participation_ratio(representation_matrix):
     """
@@ -511,7 +573,7 @@ def visualize_representation_matrices(representation_matrices, title, network_na
     pca = PCA(n_components=3)
     reduced_matrices = [pca.fit_transform(matrix.T) for matrix in representation_matrices]
 
-    fig = plt.figure(figsize=(10, 8))
+    fig = plt.figure(figsize=(12, 10))
     ax = fig.add_subplot(111, projection='3d')
 
     colors = ['r', 'g', 'b']
@@ -528,6 +590,26 @@ def visualize_representation_matrices(representation_matrices, title, network_na
 
     plt.savefig("representation_matrices.png", dpi=300, bbox_inches="tight")
     plt.show()
+
+from sklearn.cluster import KMeans, DBSCAN
+
+def find_distinct_attractors(final_states, method='kmeans', n_clusters=None, eps=0.5, min_samples=5):
+    """
+    Cluster the final states to identify distinct attractors.
+    :param final_states: Final states of shape (num_angles, hidden_size), (N, M) in this case (360, 300)
+    :param method: Clustering method ('kmeans' or 'dbscan') 
+    :param n_clusters: Number of clusters for K-Means (if method='kmeans') 
+    :param eps: Maximum distance between two samples for DBSCAN (if method='dbscan')
+    :param min_samples: Minimum number of samples in a neighborhood for DBSCAN (if method='dbscan')
+    :return Cluster labels and number of distinct attractors
+    """
+    
+    dbscan = DBSCAN(eps=eps, min_samples=min_samples)
+    labels = dbscan.fit_predict(final_states)
+    n_attractors=len(set(labels)) - (1 if -1 in labels else 0)
+    
+    return labels, n_attractors
+
 
 
 # Hyperparameters and Device
@@ -577,6 +659,7 @@ save_model(model, "trained_model_original_200epochs.pth")
 
 """
 
+
 # Task 1: Evaluate the Performance with Random Weight Noise
 # Generate the test datasets
 inputs_test, targets_test, original_degrees_test = generate_dataset(batch_size = batch_size, num_samples=1000, seq_len=250, input_duration=input_duration, noise_std=noise_std)
@@ -594,6 +677,7 @@ model3 = RNNNet(input_size=2, hidden_size=300, output_size=2).to(device)
 model1.load_state_dict(checkpoint1)
 model2.load_state_dict(checkpoint2)
 model3.load_state_dict(checkpoint3)
+
 
 """
 # Evaluate the model with varying weight noise
@@ -659,14 +743,20 @@ plt.savefig("angle_error_vs_weight_noise_combined.png", dpi=300, bbox_inches="ti
 plt.show()
 """
 
+
 network_names=['Original', 'Input_noise', 'Input_noise_Rnn_noise']
 print("executing task 2")
 # Task 2: generate representation matrix for the trained model
-representation_matrix1 = generate_representation_matrix(model1, network_names[0])
+# representation_matrix1 = generate_representation_matrix(model1, network_names[0])
 # breakpoint()
 # print("shape of it", len(representation_matrix1[0]))
-representation_matrix2 = generate_representation_matrix(model2, network_names[1])
-representation_matrix3 = generate_representation_matrix(model3, network_names[2])
+# representation_matrix2 = generate_representation_matrix(model2, network_names[1])
+# representation_matrix3 = generate_representation_matrix(model3, network_names[2])
+# Load representation matrices
+representation_matrix1 = np.load('representation_matrix1.npy')
+representation_matrix2 = np.load('representation_matrix2.npy')
+representation_matrix3 = np.load('representation_matrix3.npy')
+# np.save('representation_matrix3.npy', representation_matrix3)
 
 participation_ratio_1=participation_ratio(representation_matrix1)
 participation_ratio_2=participation_ratio(representation_matrix2)
@@ -677,13 +767,34 @@ print(f"Participation Ratio for input_error: {participation_ratio_2}")
 print(f"Participation Ratio for input_error&rnn_error: {participation_ratio_3}")
 
 # Visualize the representation matrices in 3D
-visualize_representation_matrices(
+visualize_representation_matrices (
     [representation_matrix1, representation_matrix2, representation_matrix3], title="Representation matrices in 3D",
     network_names=[f"Original_PR_{participation_ratio_1}", f"Input_noise_PR_{participation_ratio_2}", f"Input_noise_Rnn_noise_PR_{participation_ratio_3}"]
 )
 
 
+# network_names=['Original', 'Input_noise', 'Input_noise_Rnn_noise']
+# Task 2: generate representation matrix for the trained model
+# representation_matrix1 = generate_representation_matrix_evaluate(model1, network_names[0])
+# representation_matrix2 = generate_representation_matrix_evaluate(model2, network_names[1])
+# representation_matrix3 = generate_representation_matrix_evaluate(model3, network_names[2])
 
 
+# Visualize activity over time for a few angles (this is a list of angle indecies)
+# angles_to_visualize = [0, 90, 180, 270]
+
+# for angle_idx in angles_to_visualize:
+    # visualize_activity_over_time(representation_matrix1, angle_idx, title="Original")
+    # visualize_activity_over_time(representation_matrix2, angle_idx, title="Input_Noise")
+    # visualize_activity_over_time(representation_matrix3, angle_idx, title="Input_Noise_Rnn_Noise")
 
 
+# Find distinct attractors using DBSCAN
+labels1, n_attractors1 = find_distinct_attractors(representation_matrix1, eps=0.005, min_samples=1)
+labels2, n_attractors2 = find_distinct_attractors(representation_matrix2, eps=0.005, min_samples=1)
+labels3, n_attractors3 = find_distinct_attractors(representation_matrix3, eps=0.005, min_samples=1)
+
+# Print the number of distinct attractors for each model
+print(f"Number of distinct attractors for Original Network: {n_attractors1}")
+print(f"Number of distinct attractors for Input Noise Network: {n_attractors2}")
+print(f"Number of distinct attractors for Input Noise & RNN Noise Network: {n_attractors3}")
