@@ -100,7 +100,7 @@ class LowRankCTRNN(nn.Module):
             h_new: tensor of shape (batch, hidden_size)
         """
         # Compute recurrent dynamics using low-rank RNNs
-        recurrent_term = (self.U @ (self.V @ hidden.T)).T
+        recurrent_term = ((self.U @ self.V) @ hidden.T).T
         h_new = torch.relu(self.input2h(input) + recurrent_term)
         h_new = hidden * (1 - self.alpha) + h_new * self.alpha
         return h_new
@@ -306,7 +306,7 @@ def add_weight_noise_rnn_weights(model, noise_st):
     with torch.no_grad():
         # Perturb only the recurrent weights (h2h layer)
         for name, param in model.named_parameters():
-            if 'V' or 'U' in name:  # Only perturb parameters in the h2h layer
+            if 'V' or 'U' in name:  # Only perturb parameters in the rnn layer
                 noise = torch.normal(mean=0.0, std=noise_st, size=param.shape, device=param.device)
                 param.add_(noise)
 
@@ -766,36 +766,40 @@ def visualize_output(output_weight_matrix, representation_matrix, model_name):
     plt.savefig(f"2D_Projection_of_Representation_Matrix_{model_name}.png")
 
 
-def visualize_all_receptive_fields(representation_matrices):
+def visualize_tuning_curves(representation_matrices):
     """
-    Visualize the receptive fields of all neurons in a heatmap.
-
-    :param representation_matrices: List of neural representation matrices, 
-                                    each of shape (num_neurons, num_angles) -> (300, 360)
+    Visualize tuning curves for ALL neurons in a single graph using a grayscale heatmap.
+    
+    :param representation_matrices: List of neural representation matrices, each of shape (num_neurons, num_angles).
     """
-
     network_names = ['Low_rank_std_0', 'Low_rank_std_0.15']
     
     for idx, representation_matrix in enumerate(representation_matrices):
-        
-        num_neurons, num_angles = representation_matrix.shape
-        angles = np.linspace(0, 360, num_angles, endpoint=False)  # X-axis: angles
+        num_total_neurons, num_angles = representation_matrix.shape
 
-        # Sort neurons based on their peak response angle for better visualization
-        sorted_indices = np.argsort(np.argmax(representation_matrix, axis=1))
-        sorted_representation = representation_matrix[sorted_indices]
+        # Create a single figure
+        plt.figure(figsize=(12, 8))
 
-        # Create the heatmap
-        plt.figure(figsize=(8, 6))
-        plt.imshow(sorted_representation, aspect='auto', cmap='gray_r', 
-                   extent=[0, 360, 0, num_neurons])  # ✅ Corrected Y-Axis Range
-        plt.colorbar(label="Activity")
-        plt.xlabel("Input Angle (degree)")
-        plt.ylabel("Neuron (sorted)")
-        plt.title(f"Receptive Fields of All Neurons - {network_names[idx]}")
+        # X-axis: input angles (degrees)
+        angles = np.linspace(0, 360, num_angles, endpoint=False)
 
-        # Save the figure
-        plt.savefig(f"Receptive_Fields_{network_names[idx]}.png", dpi=300, bbox_inches="tight")
+        # Y-axis: neuron indices
+        neurons = np.arange(num_total_neurons)
+
+        # Create a 2D grid for angles and neurons
+        X, Y = np.meshgrid(angles, neurons)
+
+        # Plot the tuning curves as a grayscale heatmap
+        plt.pcolormesh(X, Y, representation_matrix, shading='auto', cmap='gray_r')
+        plt.colorbar(label='Activation')
+
+        # Add labels and title
+        plt.xlabel("Input Angle (degrees)")
+        plt.ylabel("Neuron Index")
+        plt.title(f"Receptive Fields for All Neurons ({network_names[idx]})")
+
+        # Save and show the plot
+        plt.savefig(f"All_neurons_tuning_curves_single_plot_gray_{network_names[idx]}.png", dpi=300, bbox_inches="tight")
         plt.show()
 
 def compute_pca_variance(activity_over_time):
@@ -825,7 +829,7 @@ def compute_pca_variance(activity_over_time):
 
 
 # Hyperparameters and Device
-device = torch.device("cpu" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("the current device is", device)
 
 
@@ -837,7 +841,6 @@ noise_std = 0.01   # Input noise std
 weight_noise_std = 0.003   # Weight noise std for evaluation
 
 
-""" 
 # Prepare training dataset
 inputs, targets, _ = generate_dataset(batch_size=batch_size, num_samples=num_samples, seq_len=seq_len, input_duration=input_duration, noise_std=noise_std)
 # inputs.to(device)
@@ -880,10 +883,10 @@ ax.set_xlabel("Epoch")
 ax.set_ylabel("Average Angle Error (degrees)")
 plt.savefig("angle_error_plot_low_rank_input_noise_rnn_noise_std_0.2.png", dpi=300, bbox_inches="tight")
 plt.show()
+
+
 """ 
-
-
-network_names=['low_rank_std_0', 'low_rank_std_0.01', 'low_rank_std_0.1', 'low_rank_std_0.15', 'low_rank_std_0.2']
+network_names=['low_rank_std_0',  'low_rank_std_0.15'] #  'low_rank_std_0.01', 'low_rank_std_0.1' 'low_rank_std_0.2']
 print("the program is executed as expected")
 # Task 1: Evaluate the Performance with Random Weight Noise
 # Generate the test datasets
@@ -911,6 +914,8 @@ model1.load_state_dict(checkpoint1)
 #model3.load_state_dict(checkpoint3)
 model4.load_state_dict(checkpoint4)
 #model5.load_state_dict(checkpoint5)
+
+"""
 
 """
 # Evaluate the model with varying weight noise
@@ -978,7 +983,6 @@ for i, network in enumerate(networks):
     plt.bar(x + i * width, df_network['mean_angle_error'], width, yerr=df_network['std_angle_error'], 
             capsize=5, label=network, color=colors[i])
 
-
 # Customize the plot
 plt.xticks(x + width, df_test1['noise_std'])
 plt.title("Angle Error vs Weight Noise Std (Comparison of Three Networks)")
@@ -1002,12 +1006,15 @@ plt.show()
 #print(f"Participation Ratio for std_0: {participation_ratio_1}")
 #print(f"Participation Ratio for std_0.15: {participation_ratio_4}")
 
-representation_matrix1 = np.load('representation_matrix1_low_rank.npy')
-representation_matrix4 = np.load('representation_matrix4_low_rank.npy')
-print("the shape of representation_matrix1", representation_matrix1.shape)
-print("the shape of representation_matrix4", representation_matrix4.shape)
+#representation_matrix1 = np.load('representation_matrix1_low_rank.npy')
+#representation_matrix4 = np.load('representation_matrix4_low_rank.npy')
+#print("the shape of representation_matrix1", representation_matrix1.shape)
+#print("the shape of representation_matrix4", representation_matrix4.shape)
 
-visualize_all_receptive_fields([representation_matrix1, representation_matrix4])
+#for idx, matrix in enumerate([representation_matrix1, representation_matrix4]):
+#    print(f"the number of non-zero neuron for the model_{network_names[idx]} ", np.count_nonzero(np.any(matrix != 0, axis=1)))
+
+#visualize_tuning_curves([representation_matrix1, representation_matrix4])
 
 """ 
 angles_to_visualize = [0, 90, 180, 270]
